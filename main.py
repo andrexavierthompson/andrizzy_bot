@@ -1,5 +1,9 @@
 import os
+import json
 import logging
+import httpx
+from datetime import date
+from pathlib import Path
 from anthropic import Anthropic
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
@@ -8,6 +12,36 @@ logger = logging.getLogger(__name__)
 
 client = Anthropic(api_key=os.environ["CLAUDE_API_KEY"])
 conversations: dict = {}
+
+DATA_DIR = Path(os.environ.get("DATA_PATH", "data"))
+BOT_NAME = "andrizzy"
+KNOWLEDGE_FILE = DATA_DIR / f"{BOT_NAME}-knowledge.json"
+
+BRIDGE_URL = os.environ.get("BRIDGE_URL", "")
+BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "changeme")
+
+
+def load_knowledge() -> dict:
+    DATA_DIR.mkdir(exist_ok=True)
+    if not KNOWLEDGE_FILE.exists():
+        KNOWLEDGE_FILE.write_text(json.dumps({"entries": []}, indent=2))
+    return json.loads(KNOWLEDGE_FILE.read_text())
+
+
+def save_knowledge(data: dict) -> None:
+    DATA_DIR.mkdir(exist_ok=True)
+    KNOWLEDGE_FILE.write_text(json.dumps(data, indent=2))
+
+
+def build_knowledge_prompt() -> str:
+    entries = load_knowledge().get("entries", [])
+    if not entries:
+        return ""
+    lines = ["\n\nADDITIONAL KNOWLEDGE (learned from Andre):"]
+    for e in entries:
+        lines.append(f"- {e['text']}")
+    return "\n".join(lines)
+
 
 SYSTEM_PROMPT = """You are Andrizzy, Andre Thompson's personal AI assistant. Andre is a final-year university student at EU Business School Barcelona and works at Elevate Barcelona — a marketing and outreach agency.
 
@@ -57,10 +91,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Research — any topic, structured reports\n"
         "• University — coursework, assignments, deadlines\n"
         "• Personal — daily life, scheduling, decisions\n\n"
-        "You also have dedicated bots for deeper work:\n"
+        "Dedicated bots for deeper work:\n"
         "• Elevate bot — full CRM and sales tools\n"
         "• Personal bot — tasks, reminders, budget\n"
         "• University bot — assignments and coursework\n\n"
+        "/claude [instruction] — run Claude Code on your Mac\n\n"
         "What do you need?"
     )
 
@@ -76,6 +111,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Assignment help, essay planning, concept explanations\n\n"
         "Personal\n"
         "Scheduling, decisions, daily life organisation\n\n"
+        "/claude [instruction] — run Claude Code on your Mac\n"
+        "/learn [text] — teach me something to remember\n"
+        "/knowledge — view everything I know\n"
+        "/forget — clear all learned knowledge\n"
         "/clear — clear conversation history\n"
         "/help — this menu"
     )
@@ -84,6 +123,53 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     conversations[update.effective_user.id] = []
     await update.message.reply_text("Cleared. Fresh start.")
+
+
+async def learn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.message.reply_text("Usage: /learn [something to remember]\nExample: /learn I prefer bullet point formats in all responses")
+        return
+    data = load_knowledge()
+    data["entries"].append({"text": text, "added": str(date.today())})
+    save_knowledge(data)
+    await update.message.reply_text(f"Got it. I'll remember: {text}")
+
+
+async def show_knowledge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    entries = load_knowledge().get("entries", [])
+    if not entries:
+        await update.message.reply_text("Nothing learned yet. Use /learn [text] to teach me something.")
+        return
+    lines = [f"Stored knowledge ({len(entries)} entries)\n"]
+    for i, e in enumerate(entries, 1):
+        lines.append(f"{i}. {e['text']}  (added {e['added']})")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def forget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    save_knowledge({"entries": []})
+    await update.message.reply_text("All learned knowledge cleared.")
+
+
+async def claude_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    instruction = " ".join(context.args).strip()
+    if not instruction:
+        await update.message.reply_text("Usage: /claude [instruction]\nExample: /claude summarise my Elevate client list")
+        return
+    if not BRIDGE_URL:
+        await update.message.reply_text("Bridge not set up yet. BRIDGE_URL is not configured.")
+        return
+    await update.message.reply_text("Sending to Claude Code on your Mac...")
+    try:
+        async with httpx.AsyncClient(timeout=10) as http:
+            await http.post(
+                f"{BRIDGE_URL}/run",
+                json={"secret": BRIDGE_SECRET, "instruction": instruction}
+            )
+        await update.message.reply_text("Task started. Result will come back shortly.")
+    except Exception as e:
+        await update.message.reply_text(f"Could not reach your Mac. Make sure the bridge server is running.\nError: {e}")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -103,7 +189,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         response = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=2048,
-            system=SYSTEM_PROMPT,
+            system=SYSTEM_PROMPT + build_knowledge_prompt(),
             messages=conversations[user_id]
         )
 
@@ -126,5 +212,9 @@ def build_app(token: str) -> Application:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("clear", clear))
+    app.add_handler(CommandHandler("learn", learn))
+    app.add_handler(CommandHandler("knowledge", show_knowledge))
+    app.add_handler(CommandHandler("forget", forget))
+    app.add_handler(CommandHandler("claude", claude_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app

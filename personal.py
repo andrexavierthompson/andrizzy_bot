@@ -11,8 +11,32 @@ logger = logging.getLogger(__name__)
 client = Anthropic(api_key=os.environ["CLAUDE_API_KEY"])
 conversations: dict = {}
 
-DATA_DIR = Path("data")
+DATA_DIR = Path(os.environ.get("DATA_PATH", "data"))
 PERSONAL_FILE = DATA_DIR / "personal.json"
+BOT_NAME = "personal"
+KNOWLEDGE_FILE = DATA_DIR / f"{BOT_NAME}-knowledge.json"
+
+
+def load_knowledge() -> dict:
+    DATA_DIR.mkdir(exist_ok=True)
+    if not KNOWLEDGE_FILE.exists():
+        KNOWLEDGE_FILE.write_text(json.dumps({"entries": []}, indent=2))
+    return json.loads(KNOWLEDGE_FILE.read_text())
+
+
+def save_knowledge(data: dict) -> None:
+    DATA_DIR.mkdir(exist_ok=True)
+    KNOWLEDGE_FILE.write_text(json.dumps(data, indent=2))
+
+
+def build_knowledge_prompt() -> str:
+    entries = load_knowledge().get("entries", [])
+    if not entries:
+        return ""
+    lines = ["\n\nADDITIONAL KNOWLEDGE (learned from Andre):"]
+    for e in entries:
+        lines.append(f"- {e['text']}")
+    return "\n".join(lines)
 
 
 def load_data() -> dict:
@@ -244,6 +268,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Decisions, advice, life organisation\n\n"
         "/tasks — view all tasks\n"
         "/budget — view budget summary\n"
+        "/learn [text] — teach me something to remember\n"
+        "/knowledge — view everything I know\n"
+        "/forget — clear all learned knowledge\n"
         "/clear — reset conversation\n"
         "/help — this menu"
     )
@@ -323,7 +350,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             response = client.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=2048,
-                system=SYSTEM_PROMPT,
+                system=SYSTEM_PROMPT + build_knowledge_prompt(),
                 tools=TOOLS,
                 messages=messages
             )
@@ -359,6 +386,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Something went wrong. Please try again.")
 
 
+async def learn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.message.reply_text("Usage: /learn [something to remember]\nExample: /learn My monthly budget is €1200")
+        return
+    data = load_knowledge()
+    data["entries"].append({"text": text, "added": str(date.today())})
+    save_knowledge(data)
+    await update.message.reply_text(f"Got it. I'll remember: {text}")
+
+
+async def show_knowledge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    entries = load_knowledge().get("entries", [])
+    if not entries:
+        await update.message.reply_text("Nothing learned yet. Use /learn [text] to teach me something.")
+        return
+    lines = [f"Stored knowledge ({len(entries)} entries)\n"]
+    for i, e in enumerate(entries, 1):
+        lines.append(f"{i}. {e['text']}  (added {e['added']})")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def forget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    save_knowledge({"entries": []})
+    await update.message.reply_text("All learned knowledge cleared.")
+
+
 def build_app(token: str) -> Application:
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
@@ -366,5 +420,8 @@ def build_app(token: str) -> Application:
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("tasks", show_tasks))
     app.add_handler(CommandHandler("budget", show_budget))
+    app.add_handler(CommandHandler("learn", learn))
+    app.add_handler(CommandHandler("knowledge", show_knowledge))
+    app.add_handler(CommandHandler("forget", forget))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app
