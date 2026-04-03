@@ -234,43 +234,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
-    messages = list(conversations[user_id])
-    final_reply = ""
+    try:
+        messages = list(conversations[user_id])
+        final_reply = ""
 
-    while True:
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2048,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
-            messages=messages
-        )
+        while True:
+            response = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=2048,
+                system=SYSTEM_PROMPT,
+                tools=TOOLS,
+                messages=messages
+            )
 
-        if response.stop_reason == "tool_use":
-            tool_results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    result = handle_tool(block.name, block.input)
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result
-                    })
-            messages.append({"role": "assistant", "content": response.content})
-            messages.append({"role": "user", "content": tool_results})
+            if response.stop_reason == "tool_use":
+                tool_results = []
+                for block in response.content:
+                    if block.type == "tool_use":
+                        result = handle_tool(block.name, block.input)
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result
+                        })
+                messages.append({"role": "assistant", "content": response.content})
+                messages.append({"role": "user", "content": tool_results})
+            else:
+                for block in response.content:
+                    if hasattr(block, "text"):
+                        final_reply = block.text
+                break
+
+        conversations[user_id].append({"role": "assistant", "content": final_reply})
+
+        if len(final_reply) > 4096:
+            for i in range(0, len(final_reply), 4096):
+                await update.message.reply_text(final_reply[i:i + 4096])
         else:
-            for block in response.content:
-                if hasattr(block, "text"):
-                    final_reply = block.text
-            break
+            await update.message.reply_text(final_reply)
 
-    conversations[user_id].append({"role": "assistant", "content": final_reply})
-
-    if len(final_reply) > 4096:
-        for i in range(0, len(final_reply), 4096):
-            await update.message.reply_text(final_reply[i:i + 4096])
-    else:
-        await update.message.reply_text(final_reply)
+    except Exception as e:
+        logger.error(f"Error in handle_message: {e}")
+        await update.message.reply_text("Something went wrong. Please try again.")
 
 
 def build_app(token: str) -> Application:

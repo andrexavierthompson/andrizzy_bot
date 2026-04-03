@@ -99,21 +99,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=2048,
-        system=SYSTEM_PROMPT,
-        messages=conversations[user_id]
-    )
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2048,
+            system=SYSTEM_PROMPT,
+            messages=conversations[user_id]
+        )
 
-    reply = response.content[0].text
-    conversations[user_id].append({"role": "assistant", "content": reply})
+        reply = response.content[0].text
+        conversations[user_id].append({"role": "assistant", "content": reply})
 
-    if len(reply) > 4096:
-        for i in range(0, len(reply), 4096):
-            await update.message.reply_text(reply[i:i + 4096])
-    else:
-        await update.message.reply_text(reply)
+        if len(reply) > 4096:
+            for i in range(0, len(reply), 4096):
+                await update.message.reply_text(reply[i:i + 4096])
+        else:
+            await update.message.reply_text(reply)
+
+    except Exception as e:
+        logger.error(f"Error in handle_message: {e}")
+        await update.message.reply_text("Something went wrong. Please try again.")
 
 
 def build_app(token: str) -> Application:
