@@ -45,7 +45,8 @@ def load_data() -> dict:
         PERSONAL_FILE.write_text(json.dumps({
             "tasks": [],
             "expenses": [],
-            "monthly_budget": None
+            "monthly_budget": None,
+            "subscriptions": []
         }, indent=2))
     return json.loads(PERSONAL_FILE.read_text())
 
@@ -139,6 +140,46 @@ TOOLS = [
             },
             "required": ["amount"]
         }
+    },
+    {
+        "name": "add_subscription",
+        "description": "Save a new recurring subscription like Spotify, Netflix, gym membership etc.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Name of the subscription e.g. Spotify"},
+                "amount": {"type": "number", "description": "Amount charged per cycle"},
+                "currency": {"type": "string", "description": "Currency code e.g. EUR, GBP, USD"},
+                "cycle": {
+                    "type": "string",
+                    "enum": ["weekly", "monthly", "yearly"],
+                    "description": "How often it recurs"
+                },
+                "next_due": {"type": "string", "description": "Next due date in YYYY-MM-DD format"},
+                "category": {"type": "string", "description": "Category e.g. entertainment, health, software, utilities"}
+            },
+            "required": ["name", "amount", "cycle"]
+        }
+    },
+    {
+        "name": "get_subscriptions",
+        "description": "Get all saved recurring subscriptions.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
+        "name": "delete_subscription",
+        "description": "Delete a recurring subscription by name.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Name of the subscription to delete"}
+            },
+            "required": ["name"]
+        }
     }
 ]
 
@@ -206,6 +247,30 @@ def handle_tool(name: str, inputs: dict) -> str:
         save_data(data)
         return f"Budget set: {inputs['amount']} {inputs.get('currency', '')}"
 
+    elif name == "add_subscription":
+        if "subscriptions" not in data:
+            data["subscriptions"] = []
+        existing = next((s for s in data["subscriptions"] if s["name"].lower() == inputs["name"].lower()), None)
+        if existing:
+            existing.update(inputs)
+            save_data(data)
+            return f"Updated subscription: {inputs['name']}"
+        inputs["added"] = str(date.today())
+        data["subscriptions"].append(inputs)
+        save_data(data)
+        return f"Saved subscription: {inputs['name']} — {inputs['amount']} {inputs.get('currency', '')} {inputs['cycle']}"
+
+    elif name == "get_subscriptions":
+        return json.dumps(data.get("subscriptions", []))
+
+    elif name == "delete_subscription":
+        keyword = inputs["name"].lower()
+        original = len(data.get("subscriptions", []))
+        data["subscriptions"] = [s for s in data.get("subscriptions", []) if keyword not in s["name"].lower()]
+        save_data(data)
+        removed = original - len(data["subscriptions"])
+        return f"Deleted {removed} subscription(s)" if removed else "Subscription not found"
+
     return "Unknown tool"
 
 
@@ -222,6 +287,12 @@ BUDGET TRACKING
 - Help Andre set and stick to a monthly budget
 - Show breakdowns by category when summarising
 - Flag if spending is close to or over budget
+
+SUBSCRIPTIONS
+- Save, view, and delete recurring subscriptions using your tools
+- When adding, confirm name, amount, currency, cycle, and next due date
+- When showing budget summary, include total monthly subscription cost
+- Flag any subscription with a next_due date within 3 days
 
 DAILY PLANNING
 - Help Andre plan his day or week
@@ -268,6 +339,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Decisions, advice, life organisation\n\n"
         "/tasks — view all tasks\n"
         "/budget — view budget summary\n"
+        "/subscriptions — view recurring subscriptions\n"
         "/learn [text] — teach me something to remember\n"
         "/knowledge — view everything I know\n"
         "/forget — clear all learned knowledge\n"
@@ -321,6 +393,35 @@ async def show_budget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         lines.append("\nBy category:")
         for cat, amount in sorted(by_category.items(), key=lambda x: x[1], reverse=True):
             lines.append(f"  {cat}: {amount:.2f}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def show_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from datetime import datetime, timedelta
+    data = load_data()
+    subs = data.get("subscriptions", [])
+    if not subs:
+        await update.message.reply_text("No subscriptions saved yet. Tell me about one to add it.")
+        return
+    today = date.today()
+    lines = [f"Subscriptions ({len(subs)} total)\n"]
+    for s in sorted(subs, key=lambda x: x.get("next_due", "9999-12-31")):
+        line = f"• {s['name']} — {s['amount']} {s.get('currency', '')} / {s.get('cycle', '')}"
+        if s.get("next_due"):
+            line += f" | next due {s['next_due']}"
+            try:
+                due = date.fromisoformat(s["next_due"])
+                days_left = (due - today).days
+                if days_left <= 3:
+                    line += f" ⚠️ due in {days_left} day(s)"
+            except ValueError:
+                pass
+        lines.append(line)
+    total_monthly = sum(
+        s["amount"] for s in subs if s.get("cycle") == "monthly"
+    )
+    if total_monthly:
+        lines.append(f"\nTotal monthly: {total_monthly:.2f}")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -420,6 +521,7 @@ def build_app(token: str) -> Application:
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("tasks", show_tasks))
     app.add_handler(CommandHandler("budget", show_budget))
+    app.add_handler(CommandHandler("subscriptions", show_subscriptions))
     app.add_handler(CommandHandler("learn", learn))
     app.add_handler(CommandHandler("knowledge", show_knowledge))
     app.add_handler(CommandHandler("forget", forget))
