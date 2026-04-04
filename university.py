@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import tempfile
+import datetime
 from datetime import date
 from pathlib import Path
 from anthropic import Anthropic
@@ -19,8 +20,23 @@ UNI_FILE = DATA_DIR / "university.json"
 BOT_NAME = "university"
 KNOWLEDGE_FILE = DATA_DIR / f"{BOT_NAME}-knowledge.json"
 PROJECTS_FILE = DATA_DIR / f"{BOT_NAME}-projects.json"
+CONFIG_FILE = DATA_DIR / f"{BOT_NAME}-config.json"
 BRIDGE_URL = os.environ.get("BRIDGE_URL", "")
 BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "changeme")
+
+
+def save_chat_id(chat_id: int) -> None:
+    DATA_DIR.mkdir(exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps({"chat_id": chat_id}, indent=2))
+
+
+def load_chat_id() -> int | None:
+    if not CONFIG_FILE.exists():
+        return None
+    try:
+        return json.loads(CONFIG_FILE.read_text()).get("chat_id")
+    except Exception:
+        return None
 
 
 def load_knowledge() -> dict:
@@ -459,6 +475,7 @@ async def _run_claude(user_id: int, messages: list, update: Update, context: Con
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     user_message = update.message.text
+    save_chat_id(update.effective_chat.id)
 
     if user_id not in conversations:
         conversations[user_id] = []
@@ -703,6 +720,70 @@ async def pforget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"Cleared all knowledge entries for project '{name}'.")
 
 
+async def send_morning_briefing(context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = load_chat_id()
+    if not chat_id:
+        return
+    try:
+        data = load_data()
+        today = date.today()
+        assignments = data.get("assignments", [])
+        pending = [a for a in assignments if a.get("status") != "done"]
+
+        lines = [f"Good morning! University briefing for {today.strftime('%A %d %B')}.\n"]
+
+        if not pending:
+            lines.append("No pending assignments. You're all caught up.")
+        else:
+            pending.sort(key=lambda a: a.get("deadline", "9999-12-31"))
+            urgent = []
+            upcoming = []
+            later = []
+            for a in pending:
+                if a.get("deadline"):
+                    try:
+                        due = date.fromisoformat(a["deadline"])
+                        days_left = (due - today).days
+                        if days_left <= 3:
+                            urgent.append((days_left, a))
+                        elif days_left <= 14:
+                            upcoming.append((days_left, a))
+                        else:
+                            later.append((days_left, a))
+                    except ValueError:
+                        upcoming.append((999, a))
+                else:
+                    upcoming.append((999, a))
+
+            if urgent:
+                lines.append("URGENT (due in 3 days or less)")
+                for days, a in urgent:
+                    due_str = "today" if days == 0 else f"in {days} day(s)"
+                    line = f"• {a['title']}"
+                    if a.get("course"):
+                        line += f" — {a['course']}"
+                    line += f" | due {due_str} [{a.get('status', 'not started')}]"
+                    lines.append(line)
+
+            if upcoming:
+                lines.append("\nUPCOMING (next 14 days)")
+                for days, a in upcoming:
+                    line = f"• {a['title']}"
+                    if a.get("course"):
+                        line += f" — {a['course']}"
+                    if a.get("deadline"):
+                        line += f" | due {a['deadline']}"
+                    line += f" [{a.get('status', 'not started')}]"
+                    lines.append(line)
+
+            if later:
+                lines.append(f"\n{len(later)} more assignment(s) due later.")
+
+        await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+    except Exception as e:
+        logger.error(f"Error sending university morning briefing: {e}")
+
+
 def build_app(token: str) -> Application:
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
@@ -719,4 +800,5 @@ def build_app(token: str) -> Application:
     app.add_handler(CommandHandler("pforget", pforget))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document_upload))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.job_queue.run_daily(send_morning_briefing, datetime.time(6, 0, 0))
     return app

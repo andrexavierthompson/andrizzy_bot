@@ -7,6 +7,9 @@ from pathlib import Path
 from anthropic import Anthropic
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+import elevate as elevate_bot
+import university as university_bot
+import personal as personal_bot
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +46,32 @@ def build_knowledge_prompt() -> str:
     return "\n".join(lines)
 
 
+TOOLS = [
+    {
+        "name": "route_to_specialist",
+        "description": (
+            "Route this message to a specialist bot that has dedicated data tools. "
+            "Use when the request involves: saving/reading clients or outreach (elevate), "
+            "saving/reading assignments or academic deadlines (university), "
+            "saving/reading tasks, budget, or subscriptions (personal). "
+            "Do NOT route for general chat, research, quick answers, or advice — handle those directly."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "bot": {
+                    "type": "string",
+                    "enum": ["elevate", "university", "personal"],
+                    "description": "Which specialist to route to"
+                },
+                "reason": {"type": "string", "description": "One-line reason for routing"}
+            },
+            "required": ["bot"]
+        }
+    }
+]
+
+
 SYSTEM_PROMPT = """You are Andrizzy, Andre Thompson's personal AI assistant. Andre is a final-year university student at EU Business School Barcelona and works at Elevate Barcelona — a marketing and outreach agency.
 
 You are the main assistant. You handle general questions and can help across all areas. For deep specialist work, remind Andre he can use his dedicated bots:
@@ -76,6 +105,11 @@ PERSONAL / LIFE
 Use when: daily life, scheduling, personal decisions, health, finances, or anything outside work and uni.
 - Be friendly and practical
 - Keep advice simple and actionable
+
+ROUTING:
+- If the request requires saving or reading data (clients, assignments, tasks, budget, subscriptions), use route_to_specialist
+- Handle everything else directly: general questions, research, quick advice, strategy, explanations
+- When routing, do not reply with text — just call the tool
 
 RULES:
 - Be concise. Bullet points over paragraphs.
@@ -186,21 +220,68 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2048,
-            system=SYSTEM_PROMPT + build_knowledge_prompt(),
-            messages=conversations[user_id]
-        )
+        messages = list(conversations[user_id])
+        route_target = None
+        final_reply = ""
 
-        reply = response.content[0].text
-        conversations[user_id].append({"role": "assistant", "content": reply})
+        while True:
+            response = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=2048,
+                system=SYSTEM_PROMPT + build_knowledge_prompt(),
+                tools=TOOLS,
+                messages=messages
+            )
 
-        if len(reply) > 4096:
-            for i in range(0, len(reply), 4096):
-                await update.message.reply_text(reply[i:i + 4096])
-        else:
-            await update.message.reply_text(reply)
+            if response.stop_reason == "tool_use":
+                tool_results = []
+                for block in response.content:
+                    if block.type == "tool_use":
+                        if block.name == "route_to_specialist":
+                            route_target = block.input.get("bot")
+                            result = f"Routing to {route_target} specialist."
+                        else:
+                            result = "Unknown tool."
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result
+                        })
+                messages.append({"role": "assistant", "content": response.content})
+                messages.append({"role": "user", "content": tool_results})
+            else:
+                for block in response.content:
+                    if hasattr(block, "text"):
+                        final_reply = block.text
+                break
+
+        if route_target:
+            conversations[user_id].append({"role": "assistant", "content": f"[Routed to {route_target} specialist]"})
+            specialist_convs = {
+                "elevate": elevate_bot.conversations,
+                "university": university_bot.conversations,
+                "personal": personal_bot.conversations,
+            }[route_target]
+            specialist_run = {
+                "elevate": elevate_bot._run_claude,
+                "university": university_bot._run_claude,
+                "personal": personal_bot._run_claude,
+            }[route_target]
+
+            if user_id not in specialist_convs:
+                specialist_convs[user_id] = []
+            specialist_convs[user_id].append({"role": "user", "content": user_message})
+            if len(specialist_convs[user_id]) > 20:
+                specialist_convs[user_id] = specialist_convs[user_id][-20:]
+
+            await specialist_run(user_id, list(specialist_convs[user_id]), update, context)
+        elif final_reply:
+            conversations[user_id].append({"role": "assistant", "content": final_reply})
+            if len(final_reply) > 4096:
+                for i in range(0, len(final_reply), 4096):
+                    await update.message.reply_text(final_reply[i:i + 4096])
+            else:
+                await update.message.reply_text(final_reply)
 
     except Exception as e:
         logger.error(f"Error in handle_message: {e}")
