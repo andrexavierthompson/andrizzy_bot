@@ -18,6 +18,7 @@ DATA_DIR = Path(os.environ.get("DATA_PATH", "data"))
 PERSONAL_FILE = DATA_DIR / "personal.json"
 BOT_NAME = "personal"
 KNOWLEDGE_FILE = DATA_DIR / f"{BOT_NAME}-knowledge.json"
+PROJECTS_FILE = DATA_DIR / f"{BOT_NAME}-projects.json"
 BRIDGE_URL = os.environ.get("BRIDGE_URL", "")
 BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "changeme")
 
@@ -41,6 +42,33 @@ def build_knowledge_prompt() -> str:
     lines = ["\n\nADDITIONAL KNOWLEDGE (learned from Andre):"]
     for e in entries:
         lines.append(f"- {e['text']}")
+    return "\n".join(lines)
+
+
+def load_projects() -> dict:
+    DATA_DIR.mkdir(exist_ok=True)
+    if not PROJECTS_FILE.exists():
+        PROJECTS_FILE.write_text(json.dumps({"active": None, "projects": {}}, indent=2))
+    return json.loads(PROJECTS_FILE.read_text())
+
+
+def save_projects(data: dict) -> None:
+    PROJECTS_FILE.write_text(json.dumps(data, indent=2))
+
+
+def build_project_prompt() -> str:
+    data = load_projects()
+    name = data.get("active")
+    if not name or name not in data["projects"]:
+        return ""
+    p = data["projects"][name]
+    lines = [f"\n\nACTIVE PROJECT: {p['name']}"]
+    if p.get("instructions"):
+        lines.append(f"Instructions: {p['instructions']}")
+    if p.get("entries"):
+        lines.append("Project Knowledge:")
+        for e in p["entries"]:
+            lines.append(f"- {e['text']}")
     return "\n".join(lines)
 
 
@@ -226,6 +254,17 @@ TOOLS = [
             },
             "required": ["title", "headers", "rows"]
         }
+    },
+    {
+        "name": "save_to_project",
+        "description": "Save a note, fact, or summary into the active project's knowledge. Use this when you generate something worth remembering for this project.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "The text to save"}
+            },
+            "required": ["text"]
+        }
     }
 ]
 
@@ -353,6 +392,15 @@ def handle_tool(name: str, inputs: dict, pending_files: list = None) -> str:
         except Exception as e:
             return f"Error generating spreadsheet: {e}"
 
+    elif name == "save_to_project":
+        proj_data = load_projects()
+        active = proj_data.get("active")
+        if not active or active not in proj_data["projects"]:
+            return "No active project to save to."
+        proj_data["projects"][active]["entries"].append({"text": inputs["text"], "added": str(date.today())})
+        save_projects(proj_data)
+        return f"Saved to project '{proj_data['projects'][active]['name']}'."
+
     return "Unknown tool"
 
 
@@ -434,7 +482,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/knowledge — view everything I know\n"
         "/forget — clear all learned knowledge\n"
         "/clear — reset conversation\n"
-        "/help — this menu"
+        "/help — this menu\n\n"
+        "Projects\n"
+        "/project create <name> — create a new project\n"
+        "/project <name> — switch active project\n"
+        "/project list — list all projects\n"
+        "/project info — show active project\n"
+        "/project delete <name> — delete a project\n"
+        "/plearn [text] — add to active project knowledge\n"
+        "/pinstruct [text] — set project instructions\n"
+        "/pknowledge — view project knowledge\n"
+        "/pforget — clear project knowledge"
     )
 
 
@@ -528,7 +586,7 @@ async def _run_claude(user_id: int, messages: list, update: Update, context: Con
         response = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=2048,
-            system=SYSTEM_PROMPT + build_knowledge_prompt(),
+            system=SYSTEM_PROMPT + build_knowledge_prompt() + build_project_prompt(),
             tools=TOOLS,
             messages=messages
         )
@@ -689,6 +747,143 @@ async def forget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("All learned knowledge cleared.")
 
 
+async def project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/project create <name> — create a new project\n"
+            "/project <name> — switch to a project\n"
+            "/project list — list all projects\n"
+            "/project info — show active project\n"
+            "/project delete <name> — delete a project"
+        )
+        return
+    sub = args[0].lower()
+    data = load_projects()
+
+    if sub == "create":
+        raw = " ".join(args[1:]).strip()
+        if not raw:
+            await update.message.reply_text("Usage: /project create <name>")
+            return
+        key = raw.lower().replace(" ", "_")
+        if key in data["projects"]:
+            await update.message.reply_text(f"Project '{raw}' already exists. Use /project {raw} to switch to it.")
+            return
+        data["projects"][key] = {"name": raw, "instructions": "", "entries": [], "created": str(date.today())}
+        data["active"] = key
+        save_projects(data)
+        await update.message.reply_text(f"Project '{raw}' created and set as active.")
+
+    elif sub == "list":
+        if not data["projects"]:
+            await update.message.reply_text("No projects yet. Use /project create <name> to start one.")
+            return
+        active = data.get("active")
+        lines = ["Projects:\n"]
+        for k, p in data["projects"].items():
+            marker = " [ACTIVE]" if k == active else ""
+            lines.append(f"• {p['name']}{marker} — {len(p['entries'])} entries")
+        await update.message.reply_text("\n".join(lines))
+
+    elif sub == "info":
+        active = data.get("active")
+        if not active or active not in data["projects"]:
+            await update.message.reply_text("No active project. Use /project create <name> or /project <name> to set one.")
+            return
+        p = data["projects"][active]
+        lines = [f"Active project: {p['name']}", f"Created: {p['created']}", f"Instructions: {p['instructions'] or '(none)'}"]
+        if p["entries"]:
+            lines.append(f"\nKnowledge ({len(p['entries'])} entries):")
+            for i, e in enumerate(p["entries"], 1):
+                lines.append(f"{i}. {e['text']}  ({e['added']})")
+        else:
+            lines.append("Knowledge: (none)")
+        await update.message.reply_text("\n".join(lines))
+
+    elif sub == "delete":
+        raw = " ".join(args[1:]).strip()
+        key = raw.lower().replace(" ", "_")
+        if key not in data["projects"]:
+            await update.message.reply_text(f"No project named '{raw}'. Use /project list to see all.")
+            return
+        del data["projects"][key]
+        if data.get("active") == key:
+            data["active"] = None
+        save_projects(data)
+        await update.message.reply_text(f"Project '{raw}' deleted.")
+
+    else:
+        raw = " ".join(args).strip()
+        key = raw.lower().replace(" ", "_")
+        if key not in data["projects"]:
+            await update.message.reply_text(f"No project named '{raw}'. Use /project list to see all.")
+            return
+        data["active"] = key
+        save_projects(data)
+        await update.message.reply_text(f"Switched to project '{data['projects'][key]['name']}'.")
+
+
+async def plearn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.message.reply_text("Usage: /plearn [something to remember for this project]")
+        return
+    data = load_projects()
+    active = data.get("active")
+    if not active or active not in data["projects"]:
+        await update.message.reply_text("No active project. Use /project create <name> to start one.")
+        return
+    data["projects"][active]["entries"].append({"text": text, "added": str(date.today())})
+    save_projects(data)
+    await update.message.reply_text(f"Saved to project '{data['projects'][active]['name']}': {text}")
+
+
+async def pinstruct(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.message.reply_text("Usage: /pinstruct [instructions for this project]")
+        return
+    data = load_projects()
+    active = data.get("active")
+    if not active or active not in data["projects"]:
+        await update.message.reply_text("No active project. Use /project create <name> to start one.")
+        return
+    data["projects"][active]["instructions"] = text
+    save_projects(data)
+    await update.message.reply_text(f"Instructions set for '{data['projects'][active]['name']}'.")
+
+
+async def pknowledge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = load_projects()
+    active = data.get("active")
+    if not active or active not in data["projects"]:
+        await update.message.reply_text("No active project. Use /project create <name> to start one.")
+        return
+    p = data["projects"][active]
+    entries = p.get("entries", [])
+    if not entries:
+        await update.message.reply_text(f"No entries in project '{p['name']}'. Use /plearn [text] to add some.")
+        return
+    lines = [f"Project '{p['name']}' knowledge ({len(entries)} entries)\n"]
+    for i, e in enumerate(entries, 1):
+        lines.append(f"{i}. {e['text']}  ({e['added']})")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def pforget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = load_projects()
+    active = data.get("active")
+    if not active or active not in data["projects"]:
+        await update.message.reply_text("No active project.")
+        return
+    name = data["projects"][active]["name"]
+    data["projects"][active]["entries"] = []
+    save_projects(data)
+    await update.message.reply_text(f"Cleared all knowledge entries for project '{name}'.")
+
+
 def build_app(token: str) -> Application:
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
@@ -700,6 +895,11 @@ def build_app(token: str) -> Application:
     app.add_handler(CommandHandler("learn", learn))
     app.add_handler(CommandHandler("knowledge", show_knowledge))
     app.add_handler(CommandHandler("forget", forget))
+    app.add_handler(CommandHandler("project", project))
+    app.add_handler(CommandHandler("plearn", plearn))
+    app.add_handler(CommandHandler("pinstruct", pinstruct))
+    app.add_handler(CommandHandler("pknowledge", pknowledge))
+    app.add_handler(CommandHandler("pforget", pforget))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document_upload))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app
