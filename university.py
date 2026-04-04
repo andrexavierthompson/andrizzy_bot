@@ -1,11 +1,14 @@
 import os
+import io
 import json
 import logging
+import tempfile
 from datetime import date
 from pathlib import Path
 from anthropic import Anthropic
-from telegram import Update
+from telegram import Update, InputFile
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+import file_generator
 
 logger = logging.getLogger(__name__)
 client = Anthropic(api_key=os.environ["CLAUDE_API_KEY"])
@@ -15,6 +18,8 @@ DATA_DIR = Path(os.environ.get("DATA_PATH", "data"))
 UNI_FILE = DATA_DIR / "university.json"
 BOT_NAME = "university"
 KNOWLEDGE_FILE = DATA_DIR / f"{BOT_NAME}-knowledge.json"
+BRIDGE_URL = os.environ.get("BRIDGE_URL", "")
+BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "changeme")
 
 
 def load_knowledge() -> dict:
@@ -111,11 +116,55 @@ TOOLS = [
             },
             "required": ["title"]
         }
+    },
+    {
+        "name": "generate_document",
+        "description": "Generate a Word (.docx) or PDF document and send it to Andre. Use for essay drafts, assignment reports, coursework submissions, study notes.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "doc_type": {"type": "string", "enum": ["docx", "pdf"], "description": "File format"},
+                "title": {"type": "string", "description": "Document title"},
+                "sections": {
+                    "type": "array",
+                    "description": "List of sections with heading and body text",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "heading": {"type": "string"},
+                            "body": {"type": "string"}
+                        }
+                    }
+                },
+                "style": {"type": "string", "enum": ["plain", "polished"], "description": "plain = clean academic format. polished = formatted with styling."},
+                "filename_hint": {"type": "string", "description": "Short slug for the filename e.g. 'marketing-essay-draft'"}
+            },
+            "required": ["doc_type", "title", "sections"]
+        }
+    },
+    {
+        "name": "generate_spreadsheet",
+        "description": "Generate an Excel (.xlsx) spreadsheet and send it to Andre. Use for assignment trackers, revision schedules, reference lists, study planners.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Spreadsheet title"},
+                "sheet_name": {"type": "string", "description": "Name for the worksheet tab"},
+                "headers": {"type": "array", "items": {"type": "string"}, "description": "Column headers"},
+                "rows": {"type": "array", "items": {"type": "array"}, "description": "Data rows, each row is an array of values"},
+                "style": {"type": "string", "enum": ["plain", "polished"], "description": "plain = simple. polished = formatted with header styling."},
+                "filename_hint": {"type": "string", "description": "Short slug for the filename"}
+            },
+            "required": ["title", "headers", "rows"]
+        }
     }
 ]
 
 
-def handle_tool(name: str, inputs: dict) -> str:
+def handle_tool(name: str, inputs: dict, pending_files: list = None) -> str:
+    if pending_files is None:
+        pending_files = []
+
     data = load_data()
 
     if name == "save_assignment":
@@ -152,6 +201,40 @@ def handle_tool(name: str, inputs: dict) -> str:
         removed = original - len(data["assignments"])
         return f"Deleted {removed} assignment(s)" if removed else "No match found"
 
+    elif name == "generate_document":
+        try:
+            doc_type = inputs.get("doc_type", "docx")
+            style = inputs.get("style", "plain")
+            hint = inputs.get("filename_hint", "")
+            if doc_type == "pdf":
+                file_bytes, filename = file_generator.generate_pdf(
+                    inputs["title"], inputs["sections"], style, "EU Business School Barcelona", hint)
+            else:
+                file_bytes, filename = file_generator.generate_word(
+                    inputs["title"], inputs["sections"], style, "EU Business School Barcelona", hint)
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{doc_type}")
+            tmp.write(file_bytes)
+            tmp.close()
+            pending_files.append((tmp.name, filename, "university"))
+            return f"Document ready: {filename}"
+        except Exception as e:
+            return f"Error generating document: {e}"
+
+    elif name == "generate_spreadsheet":
+        try:
+            style = inputs.get("style", "plain")
+            hint = inputs.get("filename_hint", "")
+            sheet = inputs.get("sheet_name", "Sheet1")
+            file_bytes, filename = file_generator.generate_excel(
+                inputs["title"], inputs["headers"], inputs["rows"], sheet, style, "EU Business School Barcelona", hint)
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+            tmp.write(file_bytes)
+            tmp.close()
+            pending_files.append((tmp.name, filename, "university"))
+            return f"Spreadsheet ready: {filename}"
+        except Exception as e:
+            return f"Error generating spreadsheet: {e}"
+
     return "Unknown tool"
 
 
@@ -176,6 +259,14 @@ EXAM & STUDY HELP
 - Help create study plans and revision schedules
 - Explain topics and summarise key concepts
 - Create practice questions or revision notes
+
+FILE GENERATION
+- You can generate Word documents (.docx), PDFs, and Excel spreadsheets
+- Use generate_document for: essay drafts, assignment reports, coursework submissions, study notes
+- Use generate_spreadsheet for: assignment trackers, revision schedules, reference lists, study planners
+- Default to style="plain" for all academic work unless Andre asks for polished format
+- Filename should reflect the assignment e.g. "marketing-essay-draft" or "assignment-tracker"
+- If Andre uploads a requirements or brief document, read it and generate the appropriate file
 
 RULES:
 - Always use Harvard citation format when referencing: (Author, Year) inline, full list at end
@@ -248,6 +339,65 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Cleared.")
 
 
+async def _run_claude(user_id: int, messages: list, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    pending_files = []
+    final_reply = ""
+
+    while True:
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2048,
+            system=SYSTEM_PROMPT + build_knowledge_prompt(),
+            tools=TOOLS,
+            messages=messages
+        )
+
+        if response.stop_reason == "tool_use":
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    result = handle_tool(block.name, block.input, pending_files)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result
+                    })
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
+        else:
+            for block in response.content:
+                if hasattr(block, "text"):
+                    final_reply = block.text
+            break
+
+    for tmp_path, display_name, subfolder in pending_files:
+        try:
+            with open(tmp_path, "rb") as f:
+                file_bytes = f.read()
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=InputFile(io.BytesIO(file_bytes), filename=display_name),
+                caption=display_name
+            )
+            await file_generator.save_to_local(display_name, file_bytes, subfolder, BRIDGE_URL, BRIDGE_SECRET)
+        except Exception as e:
+            logger.error(f"Error sending file {display_name}: {e}")
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    conversations[user_id].append({"role": "assistant", "content": final_reply})
+
+    if final_reply:
+        if len(final_reply) > 4096:
+            for i in range(0, len(final_reply), 4096):
+                await update.message.reply_text(final_reply[i:i + 4096])
+        else:
+            await update.message.reply_text(final_reply)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     user_message = update.message.text
@@ -262,47 +412,73 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
-        messages = list(conversations[user_id])
-        final_reply = ""
-
-        while True:
-            response = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=2048,
-                system=SYSTEM_PROMPT + build_knowledge_prompt(),
-                tools=TOOLS,
-                messages=messages
-            )
-
-            if response.stop_reason == "tool_use":
-                tool_results = []
-                for block in response.content:
-                    if block.type == "tool_use":
-                        result = handle_tool(block.name, block.input)
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": result
-                        })
-                messages.append({"role": "assistant", "content": response.content})
-                messages.append({"role": "user", "content": tool_results})
-            else:
-                for block in response.content:
-                    if hasattr(block, "text"):
-                        final_reply = block.text
-                break
-
-        conversations[user_id].append({"role": "assistant", "content": final_reply})
-
-        if len(final_reply) > 4096:
-            for i in range(0, len(final_reply), 4096):
-                await update.message.reply_text(final_reply[i:i + 4096])
-        else:
-            await update.message.reply_text(final_reply)
-
+        await _run_claude(user_id, list(conversations[user_id]), update, context)
     except Exception as e:
         logger.error(f"Error in handle_message: {e}")
         await update.message.reply_text("Something went wrong. Please try again.")
+
+
+async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    doc = update.message.document
+
+    supported = {
+        "text/plain", "text/markdown",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/pdf"
+    }
+    if doc.mime_type not in supported and not doc.file_name.endswith((".txt", ".md", ".docx", ".pdf")):
+        await update.message.reply_text(
+            "I can read .txt, .md, .docx, and .pdf files. Please upload one of those."
+        )
+        return
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    try:
+        tg_file = await doc.get_file()
+        buf = io.BytesIO()
+        await tg_file.download_to_memory(buf)
+        buf.seek(0)
+        raw = buf.read()
+
+        extracted = ""
+        fname = doc.file_name.lower()
+
+        if fname.endswith(".docx"):
+            from docx import Document as DocxDocument
+            d = DocxDocument(io.BytesIO(raw))
+            extracted = "\n".join(p.text for p in d.paragraphs if p.text.strip())
+        elif fname.endswith(".pdf"):
+            try:
+                import pypdf
+                reader = pypdf.PdfReader(io.BytesIO(raw))
+                extracted = "\n".join(page.extract_text() or "" for page in reader.pages)
+            except ImportError:
+                extracted = raw.decode("utf-8", errors="ignore")
+        else:
+            extracted = raw.decode("utf-8", errors="ignore")
+
+        extracted = extracted[:4000]
+
+        if user_id not in conversations:
+            conversations[user_id] = []
+
+        injected = (
+            f'[Andre uploaded a document: "{doc.file_name}"]\n\n'
+            f'Content:\n---\n{extracted}\n---\n\n'
+            f'Read this document and generate the appropriate deliverable based on its content. '
+            f'Ask if you need any clarification on format or style.'
+        )
+        conversations[user_id].append({"role": "user", "content": injected})
+        if len(conversations[user_id]) > 20:
+            conversations[user_id] = conversations[user_id][-20:]
+
+        await _run_claude(user_id, list(conversations[user_id]), update, context)
+
+    except Exception as e:
+        logger.error(f"Error in handle_document_upload: {e}")
+        await update.message.reply_text("Couldn't read that file. Please try again.")
 
 
 async def learn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -341,5 +517,6 @@ def build_app(token: str) -> Application:
     app.add_handler(CommandHandler("learn", learn))
     app.add_handler(CommandHandler("knowledge", show_knowledge))
     app.add_handler(CommandHandler("forget", forget))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document_upload))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app
