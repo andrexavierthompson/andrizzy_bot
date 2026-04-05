@@ -196,20 +196,35 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     calls = data["calls"]
     since = data.get("since", "unknown")
     input_cost, output_cost, total_cost = usage_tracker.calc_cost(input_tok, output_tok)
-    remaining = max(0, 4.86 - total_cost)
+    balance = data.get("balance", 4.43)
+    remaining = max(0, balance - total_cost)
     await update.message.reply_text(
         f"API Usage (since {since})\n\n"
         f"Tokens used:\n"
         f"  Input:  {input_tok:,}\n"
         f"  Output: {output_tok:,}\n"
         f"  Calls:  {calls}\n\n"
-        f"Estimated cost: ${total_cost:.4f}\n"
+        f"Estimated cost (this session): ${total_cost:.4f}\n"
         f"  Input:  ${input_cost:.4f}\n"
         f"  Output: ${output_cost:.4f}\n\n"
-        f"Remaining estimate: ~${remaining:.2f}\n"
-        f"(Based on $4.86 starting balance)\n\n"
-        f"/usage_reset — reset counter"
+        f"Balance: ${balance:.2f}\n"
+        f"Remaining estimate: ~${remaining:.2f}\n\n"
+        f"/usage_reset — reset counter\n"
+        f"/usage_setbalance [amount] — update balance after top-up"
     )
+
+
+async def usage_setbalance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /usage_setbalance [amount]\nExample: /usage_setbalance 10.00")
+        return
+    try:
+        amount = float(context.args[0].replace("$", "").replace(",", ""))
+    except ValueError:
+        await update.message.reply_text("Invalid amount. Example: /usage_setbalance 10.00")
+        return
+    usage_tracker.set_balance(amount)
+    await update.message.reply_text(f"Balance updated to ${amount:.2f}. Tracker will count down from here.")
 
 
 async def usage_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -336,5 +351,6 @@ def build_app(token: str) -> Application:
     app.add_handler(CommandHandler("claude", claude_command))
     app.add_handler(CommandHandler("usage", usage_command))
     app.add_handler(CommandHandler("usage_reset", usage_reset))
+    app.add_handler(CommandHandler("usage_setbalance", usage_setbalance))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app
