@@ -10,6 +10,7 @@ from anthropic import Anthropic
 from telegram import Update, InputFile
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 import file_generator
+import usage_tracker
 
 logger = logging.getLogger(__name__)
 client = Anthropic(api_key=os.environ["CLAUDE_API_KEY"])
@@ -606,6 +607,7 @@ async def _run_claude(user_id: int, messages: list, update: Update, context: Con
             tools=TOOLS,
             messages=messages
         )
+        usage_tracker.track_usage(response.usage.input_tokens, response.usage.output_tokens)
 
         if response.stop_reason == "tool_use":
             tool_results = []

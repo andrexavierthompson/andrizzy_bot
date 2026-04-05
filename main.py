@@ -10,6 +10,7 @@ from telegram.ext import Application, MessageHandler, CommandHandler, filters, C
 import elevate as elevate_bot
 import university as university_bot
 import personal as personal_bot
+import usage_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +130,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Elevate bot — full CRM and sales tools\n"
         "• Personal bot — tasks, reminders, budget\n"
         "• University bot — assignments and coursework\n\n"
-        "/claude [instruction] — run Claude Code on your Mac\n\n"
+        "/claude [instruction] — run Claude Code on your Mac\n"
+        "/usage — API credit usage\n\n"
         "What do you need?"
     )
 
@@ -146,6 +148,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Personal\n"
         "Scheduling, decisions, daily life organisation\n\n"
         "/claude [instruction] — run Claude Code on your Mac\n"
+        "/usage — Anthropic API credit usage and cost estimate\n"
         "/learn [text] — teach me something to remember\n"
         "/knowledge — view everything I know\n"
         "/forget — clear all learned knowledge\n"
@@ -184,6 +187,39 @@ async def show_knowledge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def forget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     save_knowledge({"entries": []})
     await update.message.reply_text("All learned knowledge cleared.")
+
+
+async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = usage_tracker.load_usage()
+    input_tok = data["input_tokens"]
+    output_tok = data["output_tokens"]
+    calls = data["calls"]
+    since = data.get("since", "unknown")
+    input_cost, output_cost, total_cost = usage_tracker.calc_cost(input_tok, output_tok)
+    remaining = max(0, 4.86 - total_cost)
+    await update.message.reply_text(
+        f"API Usage (since {since})\n\n"
+        f"Tokens used:\n"
+        f"  Input:  {input_tok:,}\n"
+        f"  Output: {output_tok:,}\n"
+        f"  Calls:  {calls}\n\n"
+        f"Estimated cost: ${total_cost:.4f}\n"
+        f"  Input:  ${input_cost:.4f}\n"
+        f"  Output: ${output_cost:.4f}\n\n"
+        f"Remaining estimate: ~${remaining:.2f}\n"
+        f"(Based on $4.86 starting balance)\n\n"
+        f"/usage_reset — reset counter"
+    )
+
+
+async def usage_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    old = usage_tracker.load_usage()
+    _, _, old_cost = usage_tracker.calc_cost(old["input_tokens"], old["output_tokens"])
+    usage_tracker.reset_usage()
+    await update.message.reply_text(
+        f"Counter reset.\n"
+        f"Previous total: {old['calls']} calls, ${old_cost:.4f} estimated"
+    )
 
 
 async def claude_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -232,6 +268,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 tools=TOOLS,
                 messages=messages
             )
+            usage_tracker.track_usage(response.usage.input_tokens, response.usage.output_tokens)
 
             if response.stop_reason == "tool_use":
                 tool_results = []
@@ -297,5 +334,7 @@ def build_app(token: str) -> Application:
     app.add_handler(CommandHandler("knowledge", show_knowledge))
     app.add_handler(CommandHandler("forget", forget))
     app.add_handler(CommandHandler("claude", claude_command))
+    app.add_handler(CommandHandler("usage", usage_command))
+    app.add_handler(CommandHandler("usage_reset", usage_reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app
